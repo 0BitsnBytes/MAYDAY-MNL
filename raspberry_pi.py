@@ -1,10 +1,30 @@
-from mpu6050 import mpu6050
-from bmp280 import BMP280
-import smbus2
-import serial
-import pynmea2
-import math
-import time
+from datetime import datetime  # Date recorder
+from mpu6050 import mpu6050    # Gyro and accel package
+from bmp280 import BMP280      # Barometric pressure package
+import pynmea2                 # GPS module package
+import smbus2                  # i2c protocol library
+import socket                  # Data transmission library
+import serial                  # Serial communication protocol
+import math                    # Extra math functions
+import time                    # Time management library
+import csv                     # CSV file handler
+import os                      # File management
+
+# ──────────────── Global Variables ────────────────
+gyro_data = {}
+accel_data = {}
+accel_x = 0.0
+accel_y = 0.0
+accel_z = 0.0
+g_force = 0.0
+pitch_angle = 0.0
+bank_angle = 0.0
+latitude = 0.0
+longitude = 0.0
+altitude = 0.0
+ground_speed_kmph = 0.0
+altitude_prev = 0.0
+feet_to_cm = 30.48
 
 # ──────────────── Configuration ────────────────
 anomalies = {
@@ -12,24 +32,46 @@ anomalies = {
     "bank": 30,
     "gForceP": 2.7,
     "gForceN": -1,
-    "descentRateUnder1000": 60960,     # 2000 ft/min
-    "ascentRateOver1000": 182880,      # 6000 ft/min
-    "ascentRate": 152400,              # 5000 ft/min
-    "descentRate": 152400              # 5000 ft/min
+    "descentRateUnder1000": 2000 * feet_to_cm,     # 2000 ft/min
+    "ascentRateOver1000": 6000 * feet_to_cm,      # 6000 ft/min
+    "ascentRate": 5000 * feet_to_cm,              # 5000 ft/min
+    "descentRate": 5000 * feet_to_cm              # 5000 ft/min
 }
 
-# ──────────────── Global Variables ────────────────
-gyro_data = {}
-accel_data = {}
-accel_x = accel_y = accel_z = 0.0
-g_force = 0.0
-pitch_angle = 0.0
-bank_angle = 0.0
-latitude = longitude = altitude = ground_speed_kmph = 0.0
-altitude_prev = 0.0
+# ──────────────── Log File Setup ────────────────
+log_filename = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+# Write headers if the file is new
+with open(log_filename, mode='w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow([
+        "timestamp", "latitude", "longitude", "altitude_m", "ground_speed_kmph",
+        "pitch_deg", "bank_deg", "g_force", "vertical_rate_cm_min",
+        "anomaly_detected", "anomaly_reason", "anomaly_value"
+    ])
+
+# ──────────────── Data Logger ─────────────────
+def data_log():
+    with open(log_filename, mode='a', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow([
+            datetime.now().isoformat(),
+            latitude,
+            longitude,
+            altitude,
+            ground_speed_kmph,
+            pitch,
+            bank,
+            g_force,
+            vertical_rate,
+            anomaly,
+            reason if anomaly else "",
+            amount if anomaly else ""
+    ])
 
 # ──────────────── Sensor Setup ────────────────
 def sensors_init():
+    
     global bus, bmp280, sensor, gps_serial, accel_scale_modifier
 
     bus = smbus2.SMBus(1)
@@ -45,9 +87,9 @@ def sensors_init():
     # Initialize GPS
     gps_serial = serial.Serial('/dev/serial0', baudrate=9600, timeout=1)
 
-
 # ──────────────── Read GPS Data ────────────────
 def gps_data():
+
     global latitude, longitude, altitude, ground_speed_kmph
 
     try:
@@ -70,6 +112,7 @@ def gps_data():
 
 # ──────────────── Read BMP280 Data ────────────────
 def bmp_data():
+
     global temperature, pressure, pressure_hpa, altitude
 
     try:
@@ -83,6 +126,7 @@ def bmp_data():
 
 # ──────────────── Read MPU6050 Data ────────────────
 def mpu_data():
+
     global gyro_data, accel_data, accel_x, accel_y, accel_z
 
     try:
@@ -106,11 +150,13 @@ def mpu_data():
 
 # ──────────────── Calculate Total G-Force ────────────────
 def gForce():
+
     global g_force
     g_force = math.sqrt(accel_x ** 2 + accel_y ** 2 + accel_z ** 2)
 
 # ──────────────── Get Pitch Angle ────────────────
 def get_pitch(dt):
+
     global pitch_angle
 
     try:
@@ -129,6 +175,7 @@ def get_pitch(dt):
 
 # ──────────────── Get Bank (Roll) Angle ────────────────
 def get_bank(dt):
+
     global bank_angle
 
     try:
@@ -148,32 +195,61 @@ def get_bank(dt):
 # ──────────────── Anomaly Detection ────────────────
 def detect_anomaly(vertical_rate=None):
     if abs(pitch_angle) >= anomalies['pitch']:
-        return True, "Pitch Angle Exceeded"
+        return True, "Pitch Angle Exceeded" , pitch_angle
 
     elif abs(bank_angle) >= anomalies['bank']:
-        return True, "Bank Angle Exceeded"
+        return True, "Bank Angle Exceeded" , bank_angle
 
     elif g_force >= anomalies['gForceP']:
-        return True, "High G-Force"
+        return True, "High G-Force" , g_force
 
     elif g_force <= anomalies['gForceN']:
-        return True, "Negative G-Force"
+        return True, "Negative G-Force" , g_force
 
     if vertical_rate is not None:
         if altitude < 1000:
             if vertical_rate < -anomalies['descentRateUnder1000']:
-                return True, "Rapid Descent (<1000m)"
+                return True, "Rapid Descent (<1000m)" , vertical_rate
         else:
             if vertical_rate > anomalies['ascentRateOver1000']:
-                return True, "Rapid Ascent (>1000m)"
+                return True, "Rapid Ascent (>1000m)" , vertical_rate
 
         if vertical_rate > anomalies['ascentRate']:
-            return True, "Rapid Ascent"
+            return True, "Rapid Ascent" , vertical_rate
 
         elif vertical_rate < -anomalies['descentRate']:
-            return True, "Rapid Descent"
+            return True, "Rapid Descent" , vertical_rate
 
     return False, None
+
+# ──────────────── Anomaly data send ────────────────
+def send_data(data):
+
+    host = 'YOUR_LAPTOP_PUBLIC_IP'  # or domain name
+    port = 5000
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.connect((host, port))
+        s.sendall(data.encode())
+
+# ──────────────── Logged data send ────────────────
+def send_log_file():
+
+    host = 'YOUR_LAPTOP_PUBLIC_IP'  # Change to receiver's IP
+    port = 5001  # Use a different port for log file transfer
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((host, port))
+
+            with open(log_filename, 'r') as f:
+                contents = f.read()
+
+            s.sendall(contents.encode())
+            print("✅ Log file sent successfully.")
+
+    except Exception as e:
+        print(f"[Log File Send Error] {e}")
 
 # ──────────────── Main Loop ────────────────
 if __name__ == "__main__":
@@ -205,10 +281,22 @@ if __name__ == "__main__":
             print(f"Pitch: {pitch:.1f}°, Bank: {bank:.1f}°, G: {g_force:.2f}g, Alt: {altitude:.2f}m, VRate: {vertical_rate:.1f} cm/min")
 
             # Detect anomalies
-            anomaly, reason = detect_anomaly(vertical_rate)
+            anomaly, reason, amount = detect_anomaly(vertical_rate)
             if anomaly:
-                print(f"⚠️  Anomaly Detected: {reason}")
+                print(f"⚠️ Anomaly Detected: {reason}")
 
+                data_package = {
+                    "latitude" : latitude,
+                    "longitude" : longitude,
+                    "altitude" : altitude,
+                    "ground_speed_kmph" : ground_speed_kmph,
+                    "anomaly" : [reason, amount]
+                }
+
+                send_data(str(data_package))  # Send minimal info
+                send_log_file()               # Send entire log
+
+            data_log()
             time.sleep(0.2)
 
         except KeyboardInterrupt:
