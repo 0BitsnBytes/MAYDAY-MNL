@@ -11,31 +11,43 @@ import csv                     # CSV file handler
 import os                      # File management
 
 # ──────────────── Global Variables ────────────────
-gyro_data = {}
-accel_data = {}
-accel_x = 0.0
-accel_y = 0.0
-accel_z = 0.0
-g_force = 0.0
-pitch_angle = 0.0
-bank_angle = 0.0
-latitude = 0.0
-longitude = 0.0
-altitude = 0.0
-ground_speed_kmph = 0.0
-altitude_prev = 0.0
-feet_to_cm = 30.48
+mpu_pitch_angle = 0.0
+mpu_bank_angle = 0.0
+mpu_g_force = 0.0
 
-# ──────────────── Configuration ────────────────
-anomalies = {
+gps_lat = 0.0
+gps_long = 0.0
+gps_alt = 0.0
+gps_ground_speed_kmph = 0.0
+
+bmp_temp = 0.0
+bmp_pressure = 0.0
+
+# ──────────────── Global Configs / CONSTANTS ────────────
+IP_ADDRESS = 'YOUR_LAPTOP_PUBLIC_IP'
+ACCEL_CONFIG = 0x1C              # AFS_SEL = 1 → ±4g
+MPU6050_ADDRESS = 0x68           # MPU 6050 i2c Address
+ACCEL_SCALE_MODIFIER = 8192.0    # LSB/g for ±4g
+CHECK_FREQ = 0.2
+FEET_TO_CM = 30.48
+KNOTS_TO_KMPH = 1.852
+KPA_TO_HPA = 10
+ALPHA = 0.98
+DEBUG_MODE = True
+
+# ──────────────── Triggers to activation ────────────────
+triggers = {
     "pitch": 45,
     "bank": 30,
-    "gForceP": 2.7,
+    "gForceP": 2.5,
     "gForceN": -1,
-    "descentRateUnder1000": 2000 * feet_to_cm,     # 2000 ft/min
-    "ascentRateOver1000": 6000 * feet_to_cm,      # 6000 ft/min
-    "ascentRate": 5000 * feet_to_cm,              # 5000 ft/min
-    "descentRate": 5000 * feet_to_cm              # 5000 ft/min
+    "descentRateUnder1000": 2000 * FEET_TO_CM,    # 2000 ft/min
+    "ascentRateOver1000": 6000 * FEET_TO_CM,      # 6000 ft/min
+    "ascentRate": 5000 * FEET_TO_CM,              # 5000 ft/min
+    "descentRate": 5000 * FEET_TO_CM,             # 5000 ft/min
+    "cabin_pressure": 70 * KPA_TO_HPA,            # 75 kPa
+    "lowTemp" : 10,                               # °C
+    "highTemp" : 50,                              # °C
 }
 
 # ──────────────── Log File Setup ────────────────
@@ -46,67 +58,69 @@ with open(log_filename, mode='w', newline='') as file:
     writer = csv.writer(file)
     writer.writerow([
         "timestamp", "latitude", "longitude", "altitude_m", "ground_speed_kmph",
-        "pitch_deg", "bank_deg", "g_force", "vertical_rate_cm_min",
+        "pitch_deg", "bank_deg", "g_force", "vertical_rate_cm_min", "cabin_pressure", "cabin_temperature",
         "anomaly_detected", "anomaly_reason", "anomaly_value"
     ])
 
 # ──────────────── Data Logger ─────────────────
-def data_log():
+def data_log(anomaly, reason, amount):
+
+    global gps_lat, gps_long, gps_alt, gps_ground_speed_kmph, mpu_pitch_angle, mpu_bank_angle, mpu_g_force, vertical_rate, bmp_pressure, bmp_temp
+
     with open(log_filename, mode='a', newline='') as file:
         writer = csv.writer(file)
         writer.writerow([
             datetime.now().isoformat(),
-            latitude,
-            longitude,
-            altitude,
-            ground_speed_kmph,
-            pitch,
-            bank,
-            g_force,
+            gps_lat,
+            gps_long,
+            gps_alt,
+            gps_ground_speed_kmph,
+            mpu_pitch_angle,
+            mpu_bank_angle,
+            mpu_g_force,
             vertical_rate,
+            bmp_pressure,
+            bmp_temp,
             anomaly,
             reason if anomaly else "",
             amount if anomaly else ""
-    ])
+        ])
 
 # ──────────────── Sensor Setup ────────────────
 def sensors_init():
     
-    global bus, bmp280, sensor6050, gps_serial, accel_scale_modifier
-
-    bus = smbus2.SMBus(1) # MPU 6050 I2C protocol (Gryro & Accel package)
-    sensor6050 = mpu6050(0x68)
-    
-    bmp280 = BMP280(i2c_dev=bus) # Barometric pressure and temperature package
+    global mpu_sensor, bmp_sensor, gps_sensor
 
     # Manually set accelerometer to ±4g
-    ACCEL_CONFIG = 0x1C
-    bus.write_byte_data(0x68, ACCEL_CONFIG, 0x08)  # AFS_SEL = 1 → ±4g
+    bus = smbus2.SMBus(1) # init i2c protocol
+    mpu_sensor = mpu6050(MPU6050_ADDRESS) # MPU 6050 i2c protocol (Gryro & Accel package)
+    bus.write_byte_data(MPU6050_ADDRESS, ACCEL_CONFIG, 0x08)  # AFS_SEL = 1 → ±4g
 
-    accel_scale_modifier = 8192.0  # LSB/g for ±4g
+    # Barometric pressure and temperature package
+    bmp_sensor = BMP280(i2c_dev=bus)
 
     # Initialize GPS
-    gps_serial = serial.Serial('/dev/serial0', baudrate=9600, timeout=1)
+    gps_sensor = serial.Serial('/dev/serial0', baudrate=9600, timeout=1)
 
 # ──────────────── Read GPS Data ────────────────
 def gps_data():
 
-    global latitude, longitude, altitude, ground_speed_kmph
+    global gps_lat, gps_long, gps_alt, gps_ground_speed_kmph
 
     try:
-        line = gps_serial.readline().decode('ascii', errors='replace')
-        if line.startswith('$GPGGA') or line.startswith('$GPRMC'):
-            msg = pynmea2.parse(line)
+        gps_out = gps_sensor.readline().decode('ascii', errors='replace')
+        if gps_out.startswith('$GPGGA') or gps_out.startswith('$GPRMC'):
+            msg = pynmea2.parse(gps_out)
 
             if hasattr(msg, 'latitude') and hasattr(msg, 'longitude'):
-                latitude = msg.latitude
-                longitude = msg.longitude
+                gps_lat = msg.latitude
+                gps_long = msg.longitude
 
             if hasattr(msg, 'altitude'):
-                altitude = float(msg.altitude)
+                gps_alt = float(msg.altitude)
 
             if hasattr(msg, 'spd_over_grnd'):
-                ground_speed_kmph = float(msg.spd_over_grnd) * 1.852  # knots → km/h
+                gps_ground_speed_kmph = float(msg.spd_over_grnd) * KNOTS_TO_KMPH  # knots → km/h
 
     except Exception as e:
         print(f"[GPS Error] {e}")
@@ -114,114 +128,89 @@ def gps_data():
 # ──────────────── Read BMP280 Data ────────────────
 def bmp_data():
 
-    global temperature, pressure, pressure_hpa, altitude
+    global bmp_temp, bmp_pressure #, altitude
 
     try:
-        temperature = bmp280.get_temperature()  # °C
-        pressure = bmp280.get_pressure()        # Pa
-        pressure_hpa = pressure / 100.0         # hPa
-        altitude = bmp280.get_altitude()        # Meters (if available in library)
+        bmp_temp = bmp_sensor.get_temperature()  # °C
+        pressure = bmp_sensor.get_pressure()        # Pa
+        bmp_pressure = pressure / 100.0         # hPa
+        # altitude = bmp_sensor.get_altitude()        # Meters (if available in library)
 
     except Exception as e:
         print(f"[BMP Error] {e}")
 
 # ──────────────── Read MPU6050 Data ────────────────
-def mpu_data():
+def mpu_data(dt):
 
-    global gyro_data, accel_data, accel_x, accel_y, accel_z
+    global mpu_g_force, mpu_pitch_angle, mpu_bank_angle
 
     try:
-        gyro_data = sensor6050.get_gyro_data()       # °/s
-        raw_accel = sensor6050.get_accel_data()      # Already scaled as g by mpu6050 lib
+        gyro_data = mpu_sensor.get_gyro_data()       # °/s
+        accel_data = mpu_sensor.get_accel_data()       
 
         # But we override scaling manually to match ±4g config
-        raw_x = sensor6050.read_i2c_word(0x3B)
-        raw_y = sensor6050.read_i2c_word(0x3D)
-        raw_z = sensor6050.read_i2c_word(0x3F)
+        accel_x = accel_data['x'] / ACCEL_SCALE_MODIFIER
+        accel_y = accel_data['y'] / ACCEL_SCALE_MODIFIER
+        accel_z = accel_data['z'] / ACCEL_SCALE_MODIFIER
 
-        accel_x = raw_x / accel_scale_modifier
-        accel_y = raw_y / accel_scale_modifier
-        accel_z = raw_z / accel_scale_modifier
+        # ──────────────── Calculate G Force ────────────────
+        mpu_g_force = math.sqrt(accel_x ** 2 + accel_y ** 2 + accel_z ** 2)
 
-        gForce()
-
-    except Exception as e:
-        print(f"[MPU Error] {e}")
-
-
-# ──────────────── Calculate Total G-Force ────────────────
-def gForce():
-
-    global g_force
-    g_force = math.sqrt(accel_x ** 2 + accel_y ** 2 + accel_z ** 2)
-
-# ──────────────── Get Pitch Angle ────────────────
-def get_pitch(dt):
-
-    global pitch_angle
-
-    try:
+        # ──────────────── Get Pitch and Bank (Roll) Angle ────────────────
         gyro_y = gyro_data['y']
         accel_pitch = math.degrees(math.atan2(accel_x, math.sqrt(accel_y ** 2 + accel_z ** 2)))
-        pitch_from_gyro = pitch_angle + gyro_y * dt
+        pitch_from_gyro = mpu_pitch_angle + gyro_y * dt
 
-        alpha = 0.98
-        pitch_angle = alpha * pitch_from_gyro + (1 - alpha) * accel_pitch
+        mpu_pitch_angle = ALPHA * pitch_from_gyro + (1 - ALPHA) * accel_pitch
 
-        return pitch_angle
-
-    except Exception as e:
-        print(f"[Pitch Error] {e}")
-        return None
-
-# ──────────────── Get Bank (Roll) Angle ────────────────
-def get_bank(dt):
-
-    global bank_angle
-
-    try:
+        # ──────────────── Get Bank (Roll) Angle ────────────────=
         gyro_x = gyro_data['x']
         accel_bank = math.degrees(math.atan2(accel_y, accel_z))
-        bank_from_gyro = bank_angle + gyro_x * dt
+        bank_from_gyro = mpu_bank_angle + gyro_x * dt
 
-        alpha = 0.98
-        bank_angle = alpha * bank_from_gyro + (1 - alpha) * accel_bank
-
-        return bank_angle
+        mpu_bank_angle = ALPHA * bank_from_gyro + (1 - ALPHA) * accel_bank
 
     except Exception as e:
-        print(f"[Bank Error] {e}")
-        return None
+        print(f"[MPU Read Error] {e}")
 
 # ──────────────── Anomaly Detection ────────────────
-def detect_anomaly(vertical_rate=None):
-    if abs(pitch_angle) >= anomalies['pitch']:
-        return True, "Pitch Angle Exceeded" , pitch_angle
+def detect_anomaly(vertical_rate):
+    if abs(mpu_pitch_angle) >= triggers['pitch']:
+        return True, "Pitch Angle Exceeded" , mpu_pitch_angle
 
-    elif abs(bank_angle) >= anomalies['bank']:
-        return True, "Bank Angle Exceeded" , bank_angle
+    if abs(mpu_bank_angle) >= triggers['bank']:
+        return True, "Bank Angle Exceeded" , mpu_bank_angle
 
-    elif g_force >= anomalies['gForceP']:
-        return True, "High G-Force" , g_force
+    if mpu_g_force >= triggers['gForceP']:
+        return True, "High G-Force" , mpu_g_force
 
-    elif g_force <= anomalies['gForceN']:
-        return True, "Negative G-Force" , g_force
+    if mpu_g_force <= triggers['gForceN']:
+        return True, "High Negative G-Force" , mpu_g_force
+    
+    if bmp_pressure < triggers['cabin_pressure']:
+        return True , "Low Cabin Pressure" , bmp_pressure
+    
+    if bmp_temp > triggers["highTemp"]:
+        return True , "High Temperature" , bmp_temp
+    
+    if bmp_temp < triggers["lowTemp"]:
+        return True , "Low Temperature" , bmp_temp
 
     if vertical_rate is not None:
-        if altitude < 1000:
-            if vertical_rate < -anomalies['descentRateUnder1000']:
+        if gps_alt < 1000:
+            if vertical_rate < -triggers['descentRateUnder1000']:
                 return True, "Rapid Descent (<1000m)" , vertical_rate
         else:
-            if vertical_rate > anomalies['ascentRateOver1000']:
+            if vertical_rate > triggers['ascentRateOver1000']:
                 return True, "Rapid Ascent (>1000m)" , vertical_rate
 
-        if vertical_rate > anomalies['ascentRate']:
+        if vertical_rate > triggers['ascentRate']:
             return True, "Rapid Ascent" , vertical_rate
 
-        elif vertical_rate < -anomalies['descentRate']:
+        elif vertical_rate < -triggers['descentRate']:
             return True, "Rapid Descent" , vertical_rate
 
-    return False, None
+    return False, None, None
 
 # ──────────────── Anomaly data send ────────────────
 def send_data(data):
@@ -254,51 +243,57 @@ def send_log_file():
 
 # ──────────────── Main Loop ────────────────
 if __name__ == "__main__":
+     
     sensors_init()
 
-    last_time = time.time()
-    altitude_prev = 0.0
+    prev_time = time.time()
+    prev_altitude = 0.0
 
     print("📡 Starting sensor read loop...")
 
     while True:
         try:
             current_time = time.time()
-            dt = current_time - last_time
-            last_time = current_time
+            dt = current_time - prev_time # Delta time
+            prev_time = current_time
 
-            mpu_data()
+            mpu_data(dt)
             bmp_data()
             gps_data()
 
-            pitch = get_pitch(dt)
-            bank = get_bank(dt)
-
             # Calculate vertical rate (cm/min)
-            vertical_rate = ((altitude - altitude_prev) / dt) * 60 * 100
-            altitude_prev = altitude
+            vertical_rate = ((gps_alt - prev_altitude) / dt) * 60 * 100
+            prev_altitude = gps_alt
 
-            # Print sensor data (optional)
-            print(f"Pitch: {pitch:.1f}°, Bank: {bank:.1f}°, G: {g_force:.2f}g, Alt: {altitude:.2f}m, VRate: {vertical_rate:.1f} cm/min")
+            if DEBUG_MODE:
+                # Print sensor data (optional)
+                print(f"""
+                      Pitch: {mpu_pitch_angle:.1f}°, 
+                      Bank: {mpu_bank_angle:.1f}°, 
+                      G-force: {mpu_g_force:.2f}g, 
+                      Alt: {gps_alt:.2f}m, 
+                      Vertical Rate: {vertical_rate:.1f} cm/min, 
+                      Pressure: {bmp_pressure:.1f} hPa, 
+                      Temperature: {bmp_temp:.1f} °C""")
 
-            # Detect anomalies
+            # Detect triggers
             anomaly, reason, amount = detect_anomaly(vertical_rate)
             if anomaly:
                 print(f"⚠️ Anomaly Detected: {reason}")
 
                 data_package = {
-                    "latitude" : latitude,
-                    "longitude" : longitude,
-                    "altitude" : altitude,
-                    "ground_speed_kmph" : ground_speed_kmph,
+                    "latitude" : gps_lat,
+                    "longitude" : gps_long,
+                    "altitude" : gps_alt,
+                    "ground_speed_kmph" : gps_ground_speed_kmph,
                     "anomaly" : [reason, amount]
                 }
 
                 send_data(str(data_package))  # Send minimal info
                 send_log_file()               # Send entire log
 
-            data_log()
-            time.sleep(0.2)
+            data_log(anomaly, reason, amount)
+            time.sleep(CHECK_FREQ)
 
         except KeyboardInterrupt:
             print("Exiting.")
