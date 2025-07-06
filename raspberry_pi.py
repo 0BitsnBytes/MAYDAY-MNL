@@ -72,11 +72,12 @@ def data_log():
 # ──────────────── Sensor Setup ────────────────
 def sensors_init():
     
-    global bus, bmp280, sensor, gps_serial, accel_scale_modifier
+    global bus, bmp280, sensor6050, gps_serial, accel_scale_modifier
 
-    bus = smbus2.SMBus(1)
-    bmp280 = BMP280(i2c_dev=bus)
-    sensor = mpu6050(0x68)
+    bus = smbus2.SMBus(1) # MPU 6050 I2C protocol (Gryro & Accel package)
+    sensor6050 = mpu6050(0x68)
+    
+    bmp280 = BMP280(i2c_dev=bus) # Barometric pressure and temperature package
 
     # Manually set accelerometer to ±4g
     ACCEL_CONFIG = 0x1C
@@ -130,13 +131,13 @@ def mpu_data():
     global gyro_data, accel_data, accel_x, accel_y, accel_z
 
     try:
-        gyro_data = sensor.get_gyro_data()       # °/s
-        raw_accel = sensor.get_accel_data()      # Already scaled as g by mpu6050 lib
+        gyro_data = sensor6050.get_gyro_data()       # °/s
+        raw_accel = sensor6050.get_accel_data()      # Already scaled as g by mpu6050 lib
 
         # But we override scaling manually to match ±4g config
-        raw_x = sensor.read_i2c_word(0x3B)
-        raw_y = sensor.read_i2c_word(0x3D)
-        raw_z = sensor.read_i2c_word(0x3F)
+        raw_x = sensor6050.read_i2c_word(0x3B)
+        raw_y = sensor6050.read_i2c_word(0x3D)
+        raw_z = sensor6050.read_i2c_word(0x3F)
 
         accel_x = raw_x / accel_scale_modifier
         accel_y = raw_y / accel_scale_modifier
