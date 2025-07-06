@@ -29,14 +29,14 @@ bmp_pressure = 0.0
 voice_recognition = None
 
 # ──────────────── Global Configs / CONSTANTS ────────────
-IP_ADDRESS = 'YOUR_LAPTOP_PUBLIC_IP'
+IP_ADDRESS = '192.168.68.50'
 DEBUG_MODE = True
-CHECK_FREQ = 1
+CHECK_FREQ = 5
 
 ACCEL_CONFIG = 0x1C              # AFS_SEL = 1 → ±4g
 MPU6050_ADDRESS = 0x68           # MPU 6050 i2c Address
 ACCEL_SCALE_MODIFIER = 8192.0    # LSB/g for ±4g
-ALPHA = 0.98
+ALPHA = 0.4
 
 FEET_TO_CM = 30.48
 KNOTS_TO_KMPH = 1.852
@@ -145,10 +145,10 @@ def gps_data():
                 gps_long = msg.longitude
 
             if hasattr(msg, 'altitude'):
-                gps_alt = float(msg.altitude)
+                gps_alt = round(float(msg.altitude), 0)
 
             if hasattr(msg, 'spd_over_grnd'):
-                gps_ground_speed_kmph = float(msg.spd_over_grnd) * KNOTS_TO_KMPH  # knots → km/h
+                gps_ground_speed_kmph = round(float(msg.spd_over_grnd) * KNOTS_TO_KMPH, 0)  # knots → km/h
 
     except Exception as e:
         print(f"[GPS Error] {e}")
@@ -159,9 +159,9 @@ def bmp_data():
     global bmp_temp, bmp_pressure #, altitude
 
     try:
-        bmp_temp = bmp_sensor.get_temperature()  # °C
-        pressure = bmp_sensor.get_pressure()        # Pa
-        bmp_pressure = pressure / 100.0         # hPa
+        bmp_temp = round(bmp_sensor.get_temperature(), 1)  # °C
+        pressure = bmp_sensor.get_pressure()      # Pa
+        bmp_pressure = round(pressure / 100.0, 0)         # hPa
         # altitude = bmp_sensor.get_altitude()        # Meters (if available in library)
 
     except Exception as e:
@@ -187,16 +187,16 @@ def mpu_data(dt):
         # ──────────────── Get Pitch and Bank (Roll) Angle ────────────────
         gyro_y = gyro_data['y']
         accel_pitch = math.degrees(math.atan2(accel_x, math.sqrt(accel_y ** 2 + accel_z ** 2)))
-        pitch_from_gyro = mpu_pitch_angle + gyro_y * dt
+        pitch_from_gyro = mpu_pitch_angle + gyro_y 
 
-        mpu_pitch_angle = ALPHA * pitch_from_gyro + (1 - ALPHA) * accel_pitch
+        mpu_pitch_angle = round(ALPHA * pitch_from_gyro + (1 - ALPHA) * accel_pitch, 1)
 
         # ──────────────── Get Bank (Roll) Angle ────────────────=
         gyro_x = gyro_data['x']
         accel_bank = math.degrees(math.atan2(accel_y, accel_z))
-        bank_from_gyro = mpu_bank_angle + gyro_x * dt
+        bank_from_gyro = mpu_bank_angle + gyro_x
 
-        mpu_bank_angle = ALPHA * bank_from_gyro + (1 - ALPHA) * accel_bank
+        mpu_bank_angle = round(ALPHA * bank_from_gyro + (1 - ALPHA) * accel_bank, 1)
 
     except Exception as e:
         print(f"[MPU Read Error] {e}")
@@ -305,6 +305,8 @@ if __name__ == "__main__":
             bmp_data()
             gps_data()
 
+            print(dt)
+
             # Calculate vertical rate (cm/min)
             vertical_rate = ((gps_alt - prev_altitude) / dt) * 60 * 100
             prev_altitude = gps_alt
@@ -321,7 +323,9 @@ if __name__ == "__main__":
                       Vertical Rate: {vertical_rate:.1f} cm/min, 
                       Pressure: {bmp_pressure:.1f} hPa, 
                       Temperature: {bmp_temp:.1f} °C,
-                      Distress Signal: {voice_recognition}""")
+                      Distress Signal: {voice_recognition},
+                      Latitude: {gps_lat},
+                      Longitude: {gps_long}""")
 
             # Detect triggers
             anomaly, reason, amount = detect_anomaly(vertical_rate)
