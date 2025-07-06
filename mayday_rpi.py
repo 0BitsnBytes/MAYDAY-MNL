@@ -1,14 +1,17 @@
-from datetime import datetime  # Date recorder
-from mpu6050 import mpu6050    # Gyro and accel package
-from bmp280 import BMP280      # Barometric pressure package
-import pynmea2                 # GPS module package
-import smbus2                  # i2c protocol library
-import socket                  # Data transmission library
-import serial                  # Serial communication protocol
-import math                    # Extra math functions
-import time                    # Time management library
-import csv                     # CSV file handler
-import os                      # File management
+from vosk import Model, KaldiRecognizer
+from datetime import datetime           # Date recorder
+from mpu6050 import mpu6050             # Gyro and accel package
+from bmp280 import BMP280               # Barometric pressure package
+import pynmea2                          # GPS module package
+import smbus2                           # i2c protocol library
+import socket                           # Data transmission library
+import serial                           # Serial communication protocol
+import math                             # Extra math functions
+import time                             # Time management library
+import json
+import csv                              # CSV file handler
+import os
+import pyaudio
 
 # ──────────────── Global Variables ────────────────
 mpu_pitch_angle = 0.0
@@ -23,17 +26,25 @@ gps_ground_speed_kmph = 0.0
 bmp_temp = 0.0
 bmp_pressure = 0.0
 
+voice_recognition = None
+
 # ──────────────── Global Configs / CONSTANTS ────────────
 IP_ADDRESS = 'YOUR_LAPTOP_PUBLIC_IP'
+DEBUG_MODE = True
+CHECK_FREQ = 1
+
 ACCEL_CONFIG = 0x1C              # AFS_SEL = 1 → ±4g
 MPU6050_ADDRESS = 0x68           # MPU 6050 i2c Address
 ACCEL_SCALE_MODIFIER = 8192.0    # LSB/g for ±4g
-CHECK_FREQ = 0.2
+ALPHA = 0.98
+
 FEET_TO_CM = 30.48
 KNOTS_TO_KMPH = 1.852
 KPA_TO_HPA = 10
-ALPHA = 0.98
-DEBUG_MODE = True
+
+SPEECH_PHRASES = ["mayday", "emergency"]
+SAMPLE_RATE = 16000                         # lower than 16000 to reduce CPU, still OK quality
+BUFFER_SIZE = 4000                          # small buffer for responsiveness
 
 # ──────────────── Triggers to activation ────────────────
 triggers = {
@@ -47,7 +58,7 @@ triggers = {
     "descentRate": 5000 * FEET_TO_CM,             # 5000 ft/min
     "cabin_pressure": 70 * KPA_TO_HPA,            # 75 kPa
     "lowTemp" : 10,                               # °C
-    "highTemp" : 50,                              # °C
+    "highTemp" : 50                               # °C
 }
 
 # ──────────────── Log File Setup ────────────────
@@ -59,13 +70,13 @@ with open(log_filename, mode='w', newline='') as file:
     writer.writerow([
         "timestamp", "latitude", "longitude", "altitude_m", "ground_speed_kmph",
         "pitch_deg", "bank_deg", "g_force", "vertical_rate_cm_min", "cabin_pressure", "cabin_temperature",
-        "anomaly_detected", "anomaly_reason", "anomaly_value"
+        "voice_recognised", "anomaly_detected", "anomaly_reason", "anomaly_value"
     ])
 
 # ──────────────── Data Logger ─────────────────
 def data_log(anomaly, reason, amount):
 
-    global gps_lat, gps_long, gps_alt, gps_ground_speed_kmph, mpu_pitch_angle, mpu_bank_angle, mpu_g_force, vertical_rate, bmp_pressure, bmp_temp
+    global gps_lat, gps_long, gps_alt, gps_ground_speed_kmph, mpu_pitch_angle, mpu_bank_angle, mpu_g_force, vertical_rate, bmp_pressure, bmp_temp, voice_recognition
 
     with open(log_filename, mode='a', newline='') as file:
         writer = csv.writer(file)
@@ -81,6 +92,7 @@ def data_log(anomaly, reason, amount):
             vertical_rate,
             bmp_pressure,
             bmp_temp,
+            str(voice_recognition),
             anomaly,
             reason if anomaly else "",
             amount if anomaly else ""
@@ -89,7 +101,7 @@ def data_log(anomaly, reason, amount):
 # ──────────────── Sensor Setup ────────────────
 def sensors_init():
     
-    global mpu_sensor, bmp_sensor, gps_sensor
+    global mpu_sensor, bmp_sensor, gps_sensor, speech_recognizer, stream, p
 
     # Manually set accelerometer to ±4g
     bus = smbus2.SMBus(1) # init i2c protocol
@@ -101,6 +113,22 @@ def sensors_init():
 
     # Initialize GPS
     gps_sensor = serial.Serial('/dev/serial0', baudrate=9600, timeout=1)
+
+    # Initialize Speech Recog Model
+    speech_model_path = os.path.expanduser("~/vosk-model")
+    speech_model = Model(speech_model_path)
+
+    grammar = json.dumps(SPEECH_PHRASES)
+    speech_recognizer = KaldiRecognizer(speech_model, SAMPLE_RATE, grammar)
+
+    # Initializing and Streaming Microphone
+    p = pyaudio.PyAudio()
+    stream = p.open(format=pyaudio.paInt16,
+                channels=1,
+                rate=SAMPLE_RATE,
+                input=True,
+                frames_per_buffer=BUFFER_SIZE)
+    stream.start_stream()
 
 # ──────────────── Read GPS Data ────────────────
 def gps_data():
@@ -173,6 +201,22 @@ def mpu_data(dt):
     except Exception as e:
         print(f"[MPU Read Error] {e}")
 
+# ──────────────── USB Microphone data ────────────────
+def voice_data():
+    try:
+        data = stream.read(BUFFER_SIZE, exception_on_overflow=False)
+        if speech_recognizer.AcceptWaveform(data):
+            result = json.loads(speech_recognizer.Result())
+            text = result.get("text", "").lower()
+            #print(f"? Recognized: {text}")
+            if any(phrase in text for phrase in SPEECH_PHRASES):
+                return text
+            else:
+                return None
+
+    except KeyboardInterrupt:
+        print("\n? Stopped by user.")
+
 # ──────────────── Anomaly Detection ────────────────
 def detect_anomaly(vertical_rate):
     if abs(mpu_pitch_angle) >= triggers['pitch']:
@@ -195,6 +239,9 @@ def detect_anomaly(vertical_rate):
     
     if bmp_temp < triggers["lowTemp"]:
         return True , "Low Temperature" , bmp_temp
+    
+    if voice_recognition != None:
+        return True, "Distress Signal" , voice_recognition
 
     if vertical_rate is not None:
         if gps_alt < 1000:
@@ -214,23 +261,19 @@ def detect_anomaly(vertical_rate):
 
 # ──────────────── Anomaly data send ────────────────
 def send_data(data):
-
-    host = 'YOUR_LAPTOP_PUBLIC_IP'  # or domain name
     port = 5000
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((host, port))
+        s.connect((IP_ADDRESS, port))
         s.sendall(data.encode())
 
 # ──────────────── Logged data send ────────────────
 def send_log_file():
-
-    host = 'YOUR_LAPTOP_PUBLIC_IP'  # Change to receiver's IP
     port = 5001  # Use a different port for log file transfer
 
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((host, port))
+            s.connect((IP_ADDRESS, port))
 
             with open(log_filename, 'r') as f:
                 contents = f.read()
@@ -256,6 +299,7 @@ if __name__ == "__main__":
             current_time = time.time()
             dt = current_time - prev_time # Delta time
             prev_time = current_time
+            voice_recognition = None
 
             mpu_data(dt)
             bmp_data()
@@ -264,7 +308,9 @@ if __name__ == "__main__":
             # Calculate vertical rate (cm/min)
             vertical_rate = ((gps_alt - prev_altitude) / dt) * 60 * 100
             prev_altitude = gps_alt
-
+   
+            voice_recognition = voice_data()
+            
             if DEBUG_MODE:
                 # Print sensor data (optional)
                 print(f"""
@@ -274,7 +320,8 @@ if __name__ == "__main__":
                       Alt: {gps_alt:.2f}m, 
                       Vertical Rate: {vertical_rate:.1f} cm/min, 
                       Pressure: {bmp_pressure:.1f} hPa, 
-                      Temperature: {bmp_temp:.1f} °C""")
+                      Temperature: {bmp_temp:.1f} °C,
+                      Distress Signal: {voice_recognition}""")
 
             # Detect triggers
             anomaly, reason, amount = detect_anomaly(vertical_rate)
@@ -297,4 +344,7 @@ if __name__ == "__main__":
 
         except KeyboardInterrupt:
             print("Exiting.")
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
             break
