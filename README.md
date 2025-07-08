@@ -6,7 +6,7 @@ Using a Raspberry Pi 5, a combination of onboard sensors, and offline voice reco
 
 ---
 
-## 📌 Features
+## Features
 
 - Real-time G-force, altitude, and orientation monitoring
 - Offline voice trigger detection with `vosk` (“Mayday” call)
