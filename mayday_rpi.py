@@ -128,7 +128,7 @@ def sensors_init():
     latest_transcription = None
 
     # Load Whisper model
-    model = whisper.load_model("tiny")  # or "tiny" for Raspberry Pi
+    model = whisper.load_model("base")  # or "tiny" for Raspberry Pi
 
 # ──────────────── Read GPS Data ────────────────
 def gps_data():
@@ -269,8 +269,7 @@ def audio_callback(indata, frames, time_info, status):
         print(status)
     audio_queue.put(indata.copy())
 
-# Start Whisper background thread
-# ──────────────── Start Whisper Thread ────────────────
+# ──────────────── Start Whisper Background Thread ────────────────
 def start_whisper_thread():
     global audio_stream  # Keep the stream from being garbage collected
 
@@ -284,8 +283,6 @@ def start_whisper_thread():
         callback=audio_callback
     )
     audio_stream.start()
-
-
 
 # ──────────────── Anomaly Detection ────────────────
 def detect_anomaly(vertical_rate = None):
