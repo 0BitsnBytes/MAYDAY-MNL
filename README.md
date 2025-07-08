@@ -8,15 +8,15 @@ Using a Raspberry Pi 5, a combination of onboard sensors, and offline voice reco
 
 ## 📌 Features
 
-- ✅ Real-time G-force, altitude, and orientation monitoring
-- 🎙️ Offline voice trigger detection with `vosk` (“Mayday” call)
-- 📤 Cloud-ready: Transmits critical sensor data when anomalies are detected
-- 💾 Local logging for offline fallback
-- 🧠 Runs fully offline until upload is needed
+- Real-time G-force, altitude, and orientation monitoring
+- Offline voice trigger detection with `vosk` (“Mayday” call)
+- Cloud-ready: Transmits critical sensor data when anomalies are detected
+- Local logging for offline fallback
+- Runs fully offline until upload is needed
 
 ---
 
-## 🔧 Hardware Used
+## Hardware Used
 
 | Component        | Model/Type                  | Purpose                                     |
 |------------------|-----------------------------|--------------------------------------       |
@@ -28,7 +28,7 @@ Using a Raspberry Pi 5, a combination of onboard sensors, and offline voice reco
 
 ---
 
-## 🧪 How It Works
+## How It Works
 
 1. Continuously reads sensor data (altitude, acceleration, orientation)
 2. Calculates:
