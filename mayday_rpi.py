@@ -63,7 +63,7 @@ triggers = {
     "gForceN": -0.5,
     "ascentRate": 1.52,   # m/s ascent threshold
     "descentRate": -1.52, # m/s descent threshold
-    "cabin_pressure": 70 * KPA_TO_HPA,           # 75 kPa
+    "cabin_pressure": 70 * KPA_TO_HPA,           # 70 kPa
     "lowTemp" : 10,                              # °C
     "highTemp" : 50,                             # °C
     "distress" : SPEECH_PHRASES
