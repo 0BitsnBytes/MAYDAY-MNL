@@ -24,7 +24,7 @@ Using a Raspberry Pi 5, a combination of onboard sensors, and offline voice reco
 | IMU Sensor       | MPU6050                     | Accelerometer + Gyroscope                   |
 | Barometer        | BMP280                      | Pressure, Altitude                          |
 | USB Microphone   | Any USB mic (e.g. CM108)    | Voice recognition trigger                   |
-| GPS Module       | u-blox Neo-6M               | Real-time latitude, longitude, ground speed |
+| GPS Module       | u-blox Neo-8M               | Real-time latitude, longitude, ground speed |
 
 ---
 
