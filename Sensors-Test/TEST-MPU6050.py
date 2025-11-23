@@ -1,33 +1,24 @@
+#!/usr/bin/env python3
 from mpu6050 import mpu6050
-from time import sleep
-import math
+import time
 
-sensor = mpu6050(0x68)
+def main():
+    print("Initializing MPU6050...")
+    mpu = mpu6050(0x68)
 
-while True:
-    accel_data = sensor.get_accel_data()
-    gyro_data = sensor.get_gyro_data()
-    temp = sensor.get_temp()
+    while True:
+        accel = mpu.get_accel_data()
+        gyro = mpu.get_gyro_data()
+        temp = mpu.get_temp()
 
-    print("Accelerometer data")
-    print("x: " + str(accel_data['x']))
-    print("y: " + str(accel_data['y']))
-    print("z: " + str(accel_data['z']))
+        print("=== MPU6050 DATA ===")
+        print(f"Accel (g): {accel}")
+        print(f"Gyro (deg/s): {gyro}")
+        print(f"Temp (C): {temp}") 
+        print("---------------------")
+        time.sleep(0.5)
 
-    g_force = math.sqrt(
-        accel_data['x']**2 +
-        accel_data['y']**2 +
-        accel_data['z']**2
-    ) / 9.80665
+        print("hello")
 
-
-    print(f"G-Force: {g_force:.2f} g")
-
-
-    print("Gyroscope data")
-    print("x: " + str(gyro_data['x']))
-    print("y: " + str(gyro_data['y']))
-    print("z: " + str(gyro_data['z']))
-
-    print("Temp: " + str(temp) + " C")
-    sleep(0.01)
+if __name__ == "__main__":
+    main()
