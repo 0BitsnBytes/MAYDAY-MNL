@@ -1,326 +1,172 @@
-from datetime import datetime           # Date recorder
-from mpu6050 import mpu6050             # Gyro and accel package
-from bmp280 import BMP280               # Barometric pressure package
-import sounddevice as sd                # Real-time audio input from mic
-import numpy as np                      # For numerical operations
-import threading                        # For running parallel background tasks
-import pynmea2                          # GPS module package
-import whisper                          # Speech-to-text transcription
-import smbus2                           # i2c protocol library
-import socket                           # Data transmission library
-import serial                           # Serial communication protocol
-import queue                            # Thread-safe FIFO queue
-import torch
-import math                             # Extra math functions
-import time                             # Time management library
-import csv                              # CSV file handler
-import re                               # String manipulation
+import asyncio
+import time
+from collections import deque
+from datetime import datetime
+import math
+from scripts.mpu_async import AsyncMPU
+from scripts.bmp_async import AsyncBMP
+from scripts.gps_async import AsyncGPS
+from scripts.anomaly_rules import THRESHOLDS
+from scripts.logger import create_log, append_row
+from scripts.audio_async import AsyncAudio
+import socket
 
-
-# ──────────────── Global Variables ────────────────
-mpu_pitch_angle = 0.0
-mpu_bank_angle = 0.0
-mpu_g_force = 0.0
-vertical_velocity = 0.0  # m/s
-
-gps_lat = 0.0
-gps_long = 0.0
-gps_alt = 0.0
-gps_ground_speed_kmph = 0.0
-
-bmp_temp = 0.0
-bmp_pressure = 0.0
-
-voice_recognition = None
-
-# ──────────────── Global Configs / CONSTANTS ────────────
-IP_ADDRESS = '192.168.68.50'
+# -----------------------
+# CONFIG
+# -----------------------
+ALPHA = 0.4 
 DEBUG_MODE = False
-CHECK_FREQ = 1 # >= 0.5
+LOG_RATE = 2  # seconds between writes (20 Hz)
+DEQUE_LEN_ALT = 5 # seconds
+DEQUE_LEN_PRESS = 5
+DEQUE_LEN_TEMP = 30 
+IP_ADDRESS = "192.168.3.102"
+# -----------------------
 
-ACCEL_CONFIG = 0x1C              # AFS_SEL = 1 → ±4g
-MPU6050_ADDRESS = 0x68           # MPU 6050 i2c Address
-ACCEL_SCALE_MODIFIER = 8192.0    # LSB/g for ±4g
-ALPHA = 0.4
+global_pitch_ang = 0
+global_bank_ang  = 0
+global_temp = 0.0
+global_pressure = 0.0
 
-FEET_TO_CM = 30.48
-KNOTS_TO_KMPH = 1.852
-KPA_TO_HPA = 10
+# Create log file
+log_file, LOG_FIELDS = create_log()
 
-SPEECH_PHRASES = ["mayday", "emergency", "help"]
-SAMPLE_RATE = 16000                          # lower than 16000 to reduce CPU, still OK quality
-BUFFER_SIZE = 16000                          # small buffer for responsiveness
+# History buffers for event-detection (timestamped tuples)
+ALT_HISTORY = deque(maxlen=DEQUE_LEN_ALT)    # elements: (timestamp, altitude_m)
+TEMP_HISTORY = deque(maxlen=DEQUE_LEN_TEMP)  # elements: (timestamp, speed_m_s)
+PRESS_HISTORY = deque(maxlen=DEQUE_LEN_PRESS)  # elements: (timestamp, pressure_hpa)
 
-# Whisper Parameters
-CHUNK_DURATION = 3  # seconds
-CHANNELS = 1
+# Helper: trim histories to window seconds
+def trim_history(history, window_s):
+    now = time.time()
+    while history and (now - history[0][0]) > window_s:
+        history.popleft()
 
-# ──────────────── Triggers to activation ────────────────
-triggers = {
-    "pitch": 45,
-    "bank": 30,
-    "gForceP": 2,
-    "gForceN": -0.5,
-    "ascentRate": 1.52,   # m/s ascent threshold
-    "descentRate": -1.52, # m/s descent threshold
-    "cabin_pressure": 70 * KPA_TO_HPA,           # 70 kPa
-    "lowTemp" : 10,                              # °C
-    "highTemp" : 50,                             # °C
-    "distress" : SPEECH_PHRASES
-}
+# Anomaly detection function using THRESHOLDS
+def detect_anomalies(audio, mpu, bmp):
+    global global_pitch_ang, global_bank_ang, global_temp, global_pressure
+    g_force = rate_alt_change = temp_change = pressure_change = 0.0
+    anomaly = False
+    value = []
+    reason = []
 
-# ──────────────── Log File Setup ────────────────
-log_filename = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    """
+    Returns (anomaly_bool, reason_str, value)
+    Keeps logic and reasons similar to your old script.
+    """
+    #print(audio)
 
-# Write headers if the file is new
-with open(log_filename, mode='w', newline='') as file:
-    writer = csv.writer(file)
-    writer.writerow([
-        "timestamp", "lat", "long", "alt_m", "gr_speed_kmph", "pitch_deg", "bank_deg", 
-        "g_force", # "vert_rate_cm_min", 
-        "cabin_pressure", "cabin_temp", "voice_recog", "anomaly", "a_reason", "a_val"
-    ])
+    if mpu:
+        # ???????????????? Get Pitch and Bank (Roll) Angle ????????????????
+        gyro_data = mpu["gyro"]
+        accel = mpu["accel"]
 
-# ──────────────── Data Logger ─────────────────
-def data_log(anomaly, reason, amount):
-
-    global gps_lat, gps_long, gps_alt, gps_ground_speed_kmph, mpu_pitch_angle, mpu_bank_angle, mpu_g_force, vertical_rate, bmp_pressure, bmp_temp, voice_recognition
-
-    with open(log_filename, mode='a', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow([
-            datetime.now().isoformat(),
-            gps_lat,
-            gps_long,
-            gps_alt,
-            gps_ground_speed_kmph,
-            mpu_pitch_angle,
-            mpu_bank_angle,
-            mpu_g_force,
-            #vertical_rate,
-            bmp_pressure,
-            bmp_temp,
-            str(voice_recognition),
-            anomaly,
-            reason if anomaly else "",
-            amount if anomaly else ""
-        ])
-
-# ──────────────── Sensor Setup ────────────────
-def sensors_init():
-    
-    global mpu_sensor, bmp_sensor, gps_sensor, audio_queue, latest_transcription, model
-
-    # Manually set accelerometer to ±4g
-    bus = smbus2.SMBus(1)                                     # init i2c protocol
-    mpu_sensor = mpu6050(MPU6050_ADDRESS)                     # MPU 6050 i2c protocol (Gryro & Accel package)
-    bus.write_byte_data(MPU6050_ADDRESS, ACCEL_CONFIG, 0x08)  # AFS_SEL = 1 → ±4g
-
-    # Barometric pressure and temperature package
-    bmp_sensor = BMP280(i2c_dev=bus)
-
-    # Initialize GPS
-    gps_sensor = serial.Serial('/dev/serial0', baudrate=9600, timeout=1)
-
-    # Initialize Speech Recog Model
-    # Shared queue and transcription result
-    audio_queue = queue.Queue()
-    latest_transcription = None
-
-    # Load Whisper model
-    model = whisper.load_model("base")  # or "tiny" for Raspberry Pi
-
-# ──────────────── Read GPS Data ────────────────
-def gps_data():
-    global gps_lat, gps_long, gps_alt, gps_ground_speed_kmph
-
-    try:
-        for _ in range(10):  # Try 10 lines per call
-            gps_out = gps_sensor.readline().decode('ascii', errors='replace').strip()
-            
-            if gps_out.startswith('$GPGGA') or gps_out.startswith('$GPRMC'):
-                msg = pynmea2.parse(gps_out)
-
-                if hasattr(msg, 'latitude') and hasattr(msg, 'longitude'):
-                    gps_lat = msg.latitude
-                    gps_long = msg.longitude
-
-                if hasattr(msg, 'altitude'):
-                    gps_alt = round(float(msg.altitude), 0)
-
-                if hasattr(msg, 'spd_over_grnd'):
-                    gps_ground_speed_kmph = round(float(msg.spd_over_grnd) * KNOTS_TO_KMPH, 0)
-                
-                break  # exit loop after successful parse
-
-    except Exception as e:
-        print(f"[GPS Error] {e}")
-
-
-# ──────────────── Read BMP280 Data ────────────────
-def bmp_data():
-
-    global bmp_temp, bmp_pressure #, altitude
-
-    try:
-        bmp_temp = round(bmp_sensor.get_temperature(), 1)   # °C
-        pressure = bmp_sensor.get_pressure()                # Pa
-        bmp_pressure = round(pressure,2)                    # hPa
-        # altitude = bmp_sensor.get_altitude()              # Meters (if available in library)
-
-    except Exception as e:
-        print(f"[BMP Error] {e}")
-
-# ──────────────── Read MPU6050 Data ────────────────
-def mpu_data(dt):
-
-    global mpu_g_force, mpu_pitch_angle, mpu_bank_angle, vertical_accel
-
-    try:
-        gyro_data = mpu_sensor.get_gyro_data()  # °/s
-        accel_data = mpu_sensor.get_accel_data()       
-
-        # But we override scaling manually to match ±4g config
-        accel_x = accel_data['x'] 
-        accel_y = accel_data['y'] 
-        accel_z = accel_data['z'] 
-
-        # ──────────────── Calculate G Force ────────────────
-        mpu_g_force = round(math.sqrt(accel_x**2 + accel_y**2 + accel_z**2) / 9.81, 2)
-
-        # ──────────────── Get Pitch and Bank (Roll) Angle ────────────────
+        # get Pitch
+        global_pitch_ang = gyro_data['y']
+        """
         gyro_y = gyro_data['y']
-        accel_pitch = math.degrees(math.atan2(accel_x, math.sqrt(accel_y ** 2 + accel_z ** 2)))
-        pitch_from_gyro = mpu_pitch_angle + gyro_y 
-
-        mpu_pitch_angle = round(ALPHA * pitch_from_gyro + (1 - ALPHA) * accel_pitch, 1)
-
-        # ──────────────── Get Bank (Roll) Angle ────────────────=
+        accel_pitch = math.degrees(math.atan2(accel['x'], math.sqrt(accel['y'] ** 2 + accel['z'] ** 2)))
+        pitch_from_gyro = global_pitch_ang + gyro_y 
+        global_pitch_ang = round(ALPHA * pitch_from_gyro + (1 - ALPHA) * accel_pitch, 1) 
+        """
+        
+        #print(f"pitch angle : {global_pitch_ang}")
+        
+        # get Bank
+        global_bank_ang = gyro_data['z']
+        """
         gyro_x = gyro_data['x']
-        accel_bank = math.degrees(math.atan2(accel_y, accel_z))
-        bank_from_gyro = mpu_bank_angle + gyro_x
+        accel_bank = math.degrees(math.atan2(accel['y'], accel['z']))
+        bank_from_gyro = global_bank_ang + gyro_x
+        global_bank_ang = round(ALPHA * bank_from_gyro + (1 - ALPHA) * accel_bank, 1)
+        #print(f"bank angle : {global_bank_ang}")
+        """
 
-        mpu_bank_angle = round(ALPHA * bank_from_gyro + (1 - ALPHA) * accel_bank, 1)
-
-        # ───── Estimate Vertical Acceleration (in m/s²) ─────        
         
-        #gyro_y = gyro_data['y']
-        #accel_pitch = math.degrees(math.atan2(accel_x, math.sqrt(accel_y ** 2 + accel_z ** 2)))
-        #pitch_from_gyro = mpu_pitch_angle + gyro_y * dt  # Note: multiply gyro by dt here
-        #mpu_pitch_angle = round(ALPHA * pitch_from_gyro + (1 - ALPHA) * accel_pitch, 1)
+        # get g_force
+        g_force = round(math.sqrt(accel['x']**2 + accel['y']**2 + accel['z']**2) / 9.81, 2)
+        #print(f"G force : {g_force}")
+
+    #print("bmp data : ",bmp)
+    if bmp and bmp.get("altitude") is not None:
+        # append history and trim
+        ALT_HISTORY.append(bmp["altitude"])
+        rate_alt_change = (ALT_HISTORY[-1] - ALT_HISTORY[0])/LOG_RATE*DEQUE_LEN_ALT
+    
+    if bmp and bmp.get("temprature") is not None:
+        # append history and trim
+        TEMP_HISTORY.append(bmp["temprature"])
+        temp_change = (ALT_HISTORY[-1] - ALT_HISTORY[0])
+    
+    if bmp and bmp.get("pressure") is not None:
+        # append history and trim
+        PRESS_HISTORY.append(bmp["pressure"])
+        pressure_change = (PRESS_HISTORY[-1] - PRESS_HISTORY[0])
+
+    ## return anomaly 
+    if audio:
+        for word in THRESHOLDS["TRIGGER_WORDS"]:
+            for i in range(len(audio)):
+                if word in audio[i]:
+                    audio[i] = 'PROCESSED'
+                    anomaly = True
+                    value.append(word)
+                    reason.append("TRIGGER_WORD")
+                    #return True, "TRIGGER_WORD", word
+
+    #print(PRESS_HISTORY[-1])
+    if PRESS_HISTORY[-1] < THRESHOLDS["LOW_CABIN_PRESSURE"]:
+        anomaly = True
+        value.append(PRESS_HISTORY[-1])
+        reason.append("LOW_CABIN_PRESSURE")
+        #return True, "LOW_CABIN_PRESSURE", PRESS_HISTORY[-1]
+
+    #print(temp_change)
+    if abs(temp_change) > THRESHOLDS["TEMP_CHANGE"]:
+        anomaly = True
+        value.append(round(temp_change,2))
+        reason.append("TEMP_CHANGE")
+        #return True, "TEMP_CHANGE", round(temp_change,2)
+    
+    #print(pressure_change)
+    if abs(pressure_change) > THRESHOLDS["PRESSURE_CHANGE"]:
+        anomaly = True
+        value.append(round(pressure_change,2))
+        reason.append("PRESSURE_CHANGE")
+        #return True, "PRESSURE_CHANGE", round(pressure_change,2)
+    
+    #print(rate_alt_change)
+    if abs(rate_alt_change) > THRESHOLDS["ALT_DROP_M"]:
+        anomaly = True
+        value.append(round(rate_alt_change,2))
+        reason.append("ALTITUDE_CHANGE")
+        #return True, "ALTITUDE_CHANGE", round(rate_alt_change,2) 
+      
+    if g_force <= THRESHOLDS["G_FORCE_LOW"]:
+        anomaly = True
+        value.append(g_force)
+        reason.append("LOW_G_FORCE")
+        #return True, "LOW_G_FORCE", g_force  
+    
+    if g_force >= THRESHOLDS["G_FORCE_HIGH"]:
+        anomaly = True
+        value.append(g_force)
+        reason.append("HIGH_G_FORCE")
+        #return True, "HIGH_G_FORCE", g_force
         
-        #gyro_x = gyro_data['x']
-        #accel_bank = math.degrees(math.atan2(accel_y, accel_z))
-        #bank_from_gyro = mpu_bank_angle + gyro_x * dt  # multiply by dt
-        #mpu_bank_angle = round(ALPHA * bank_from_gyro + (1 - ALPHA) * accel_bank, 1)
-        
-        # Gravity removal with pitch and bank
-        #g = 9.81
-        #pitch_rad = math.radians(mpu_pitch_angle)
-        #bank_rad = math.radians(mpu_bank_angle)
-        #gravity_z = g * math.cos(pitch_rad) * math.cos(bank_rad)
-        #linear_accel_z = accel_z * g - gravity_z
-        #vertical_velocity += linear_accel_z * dt
-        #vertical_velocity = max(min(vertical_velocity, 30), -30)  # Adjust limits as needed
+    if abs(global_bank_ang) >= THRESHOLDS["BANK_DEG"]:
+        anomaly = True
+        value.append(global_bank_ang)
+        reason.append("BANK_EXCEEDED")
+        #return True, "BANK_EXCEEDED", global_bank_ang
 
-    except Exception as e:
-        print(f"[MPU Read Error] {e}")
+    if abs(global_pitch_ang) >= THRESHOLDS["PITCH_DEG"]:
+        anomaly = True
+        value.append(global_pitch_ang)
+        reason.append("PITCH_EXCEEDED")
+        #return True, "PITCH_EXCEEDED", global_pitch_ang
 
-# ──────────────── USB Microphone data ────────────────
-def whisper_worker():
-    global voice_recognition
-    buffer = np.empty((0, CHANNELS), dtype=np.float32)
-
-    while True:
-        try:
-            data = audio_queue.get(timeout=0.1)
-            buffer = np.concatenate((buffer, data), axis=0)
-
-            if len(buffer) >= SAMPLE_RATE * CHUNK_DURATION:
-                audio_chunk = buffer[:SAMPLE_RATE * CHUNK_DURATION]
-                buffer = buffer[SAMPLE_RATE * CHUNK_DURATION:]
-
-                # Flatten and convert for VAD
-                mono_audio = audio_chunk.flatten()
-
-                # If speech detected, transcribe with Whisper
-                result = model.transcribe(mono_audio, fp16=False, language="en")
-                transcription = result['text'].strip().lower()
-
-                # Skip weird characters
-                if not re.match(r'^[a-zA-Z0-9\s.,!?\'-]+$', transcription):
-                    print("🚫 Ignoring non-English or corrupted transcription.")
-                    continue
-
-                print(f"🎤 Transcribed: {transcription}")
-
-                for phrase in SPEECH_PHRASES:
-                    if re.search(r'\b' + re.escape(phrase) + r'\b', transcription):
-                        voice_recognition = phrase
-                        print(f"🚨 Keyword Detected: {phrase}")
-                        break
-
-        except queue.Empty:
-            continue
-
-# Audio callback for sounddevice
-def audio_callback(indata, frames, time_info, status):
-    if status:
-        print(status)
-    audio_queue.put(indata.copy())
-
-# ──────────────── Start Whisper Background Thread ────────────────
-def start_whisper_thread():
-    global audio_stream  # Keep the stream from being garbage collected
-
-    # Start background thread to run Whisper
-    threading.Thread(target=whisper_worker, daemon=True).start()
-
-    # Create and start microphone audio stream
-    audio_stream = sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=CHANNELS,
-        callback=audio_callback
-    )
-    audio_stream.start()
-
-# ──────────────── Anomaly Detection ────────────────
-def detect_anomaly(vertical_rate = None):
-    global voice_recognition
-
-    if abs(mpu_pitch_angle) >= triggers['pitch']:
-        return True, "Pitch Angle Exceeded" , mpu_pitch_angle
-
-    if abs(mpu_bank_angle) >= triggers['bank']:
-        return True, "Bank Angle Exceeded" , mpu_bank_angle
-    
-    if bmp_pressure < triggers['cabin_pressure']:
-        return True , "Low Cabin Pressure" , bmp_pressure
-    
-    if bmp_temp > triggers["highTemp"]:
-        return True , "High Temperature" , bmp_temp
-    
-    if mpu_g_force >= triggers['gForceP']:
-        return True, "High G-Force" , mpu_g_force
-
-    if mpu_g_force <= triggers['gForceN']:
-        return True, "High Negative G-Force" , mpu_g_force
-    
-    if bmp_temp < triggers["lowTemp"]:
-        return True , "Low Temperature" , bmp_temp
-    
-    #if vertical_velocity > triggers['ascentRate']:
-    #    return True, "Rapid Ascent", vertical_velocity
-
-    #if vertical_velocity < triggers['descentRate']:
-    #    return True, "Rapid Descent", vertical_velocity
-
-    if voice_recognition in triggers["distress"]:
-        word = voice_recognition
-        voice_recognition = None
-        return True, "Distress Signal" , word
-
-    return False, None, None
+    return anomaly, reason, value
 
 # ──────────────── Anomaly data send ────────────────
 def send_data(data):
@@ -338,7 +184,7 @@ def send_log_file():
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((IP_ADDRESS, port))
 
-            with open(log_filename, 'r') as f:
+            with open(log_file, 'r') as f:
                 contents = f.read()
 
             s.sendall(contents.encode())
@@ -347,61 +193,92 @@ def send_log_file():
     except Exception as e:
         print(f"[Log File Send Error] {e}")
 
-# ──────────────── Main Loop ────────────────
-if __name__ == "__main__":
-     
-    sensors_init()
-    start_whisper_thread()
+# -----------------------
+# Main async orchestrator
+# -----------------------
+async def main():
+    print("📡 MAYDAY initializing sensors...")
+    gps = AsyncGPS()       # /dev/serial0 @ 9600
+    mpu = AsyncMPU()       # MPU6050
+    bmp = AsyncBMP()       # BMP280
+    audio = AsyncAudio()   # Audio
 
-    prev_time = time.time()
-    prev_altitude = 0.0
-
-    print("📡 Starting sensor read loop...")
-
-    while True:
-        try:
-            current_time = time.time()
-            dt = current_time - prev_time
-            prev_time = current_time
-
-            gps_data()
-
-            if gps_lat == 0.0 and gps_long == 0.0:
-                print("🛰️ Waiting for GPS fix...")
-                #continue
-
-            mpu_data(dt)
-            bmp_data()
-
-            # Cap vertical_velocity to avoid drift explosion
-            #vertical_velocity = max(min(vertical_velocity, 100), -100)  # m/s
-            #vertical_rate = vertical_velocity  # in m/s now, just rename if you want
-
-            if latest_transcription is not None:  
-                voice_recognition = latest_transcription
-                latest_transcription = None
+    # start background loops
+    asyncio.create_task(gps.read_loop())
+    asyncio.create_task(mpu.read_loop())
+    asyncio.create_task(bmp.read_loop())
+    asyncio.create_task(audio.read_loop())
 
 
+    print("Sensors started. Logging to:", log_file)
+
+    try:
+        while True:
+            tstamp = datetime.now().isoformat()
+
+            gps_data = gps.get()
+            mpu_data = mpu.get()
+            bmp_data = bmp.get()
+            audio_data = audio.get()
+
+            #print(audio_data)
+
+            # Prepare row dict for logger
+            row = {
+                "timestamp": tstamp,
+                "lat":  gps_data.get("lat")   if gps_data else "",
+                "lon":  gps_data.get("lon")   if gps_data else "",
+                "alt":  gps_data.get("alt")   if gps_data else "",
+                "sats": gps_data.get("sats")  if gps_data else "",
+                "fix":  gps_data.get("fix")   if gps_data else "",
+                "speed":gps_data.get("speed") if gps_data else "",
+
+                "accel_x": mpu_data["accel"]["x"] if mpu_data else "",
+                "accel_y": mpu_data["accel"]["y"] if mpu_data else "",
+                "accel_z": mpu_data["accel"]["z"] if mpu_data else "",
+                "gyro_x":  mpu_data["gyro"]["x"]  if mpu_data else "",
+                "gyro_y":  mpu_data["gyro"]["y"]  if mpu_data else "",
+                "gyro_z":  mpu_data["gyro"]["z"]  if mpu_data else "",
+                "temp_c":  mpu_data["temp"] if mpu_data else "",
+                #"pitch_deg": mpu_data["pitch"] if mpu_data else "",
+                #"bank_deg":  mpu_data["bank"]  if mpu_data else "",
+                #"g_force":   mpu_data["g_force"] if mpu_data else "",
+
+                "bmp_temp_c": bmp_data["temperature"] if bmp_data else "",
+                "bmp_pressure_hpa": bmp_data["pressure"] if bmp_data else "",
+                "bmp_alt_m": bmp_data["altitude"] if bmp_data else ""
+            }
+
+            # Detect anomalies using the function that references THRESHOLDS
+            #print(f"bmp_data = {bmp_data}, gps = {gps_data}, mpu_data = {mpu_data}")
+            anomaly = reason = val = None
+            if bmp_data and mpu_data:
+                anomaly, reason, val = detect_anomalies(audio_data, mpu_data, bmp_data)
+            row["anomaly"] = anomaly
+            row["anom_reason"] = reason
+            row["anom_val"] = val
+
+            # voice 
+
+            # Append to CSV
+            append_row(log_file, LOG_FIELDS, row)
+
+            # Debug printing
             if DEBUG_MODE:
-                print(f"""
-Pitch: {mpu_pitch_angle:.1f}°, 
-Bank: {mpu_bank_angle:.1f}°, 
-G-force: {mpu_g_force:.2f}g, 
-Alt: {gps_alt:.2f} m,  
-Pressure: {bmp_pressure:.1f} hPa, 
-Temperature: {bmp_temp:.1f} °C,
-Distress Signal: {voice_recognition},
-Latitude: {gps_lat},
-Longitude: {gps_long}""")
-
-
-            anomaly, reason, amount = detect_anomaly() #vertical_rate)
+                print(row)
             if anomaly:
-                print(f"⚠️ Anomaly Detected: {reason}")
+                print("⚠️ ANOMALY:", reason, val)
+                send_log_file()
 
-            data_log(anomaly, reason, amount)
-            time.sleep(CHECK_FREQ)
+            # time.sleep(1)
+            await asyncio.sleep(LOG_RATE)
 
-        except KeyboardInterrupt:
-            print("Exiting.")
-            break
+    except asyncio.CancelledError:
+        pass
+    except KeyboardInterrupt:
+        print("Keyboard interrupt — shutting down.")
+    finally:
+        print("Stopping. Last log:", log_file)
+
+if __name__ == "__main__":
+    asyncio.run(main()) 
