@@ -1,47 +1,41 @@
+#!/usr/bin/env python3
 import serial
 import pynmea2
 
-def check_gps():
-    gps_port = '/dev/serial0'  # adjust if needed
-    baudrate = 9600
+def main():
+    print("Opening GPS on /dev/serial0 @ 9600 baud...")
 
-    try:
-        ser = serial.Serial(gps_port, baudrate=baudrate, timeout=1)
-        print("? Reading GPS data. Press Ctrl+C to stop.\n")
+    gps = serial.Serial("/dev/serial0", baudrate=9600, timeout=1)
 
-        while True:
-            line = ser.readline().decode('ascii', errors='replace').strip()
-            if not line.startswith('$'):
+    while True:
+        try:
+            line = gps.readline().decode("ascii", errors="ignore").strip()
+
+            if not line.startswith("$"):
                 continue
 
-            try:
-                msg = pynmea2.parse(line)
+            msg = pynmea2.parse(line)
 
-                if isinstance(msg, pynmea2.GGA):
-                    fix_quality = msg.gps_qual
-                    satellites = msg.num_sats
-                    print(f"? GGA ? Fix quality: {fix_quality}, Satellites: {satellites}")
+            if isinstance(msg, pynmea2.types.talker.GGA):
+                print("=== GPS GGA Fix ===")
+                print(f"Latitude:  {msg.latitude}")
+                print(f"Longitude: {msg.longitude}")
+                print(f"Satellites: {msg.num_sats}")
+                print(f"Altitude:  {msg.altitude} m")
+                print("---------------------")
 
-                    if fix_quality > 0:
-                        print(f"? Location: {msg.latitude:.5f} {msg.lat_dir}, {msg.longitude:.5f} {msg.lon_dir}")
-                        print(f"   Altitude: {msg.altitude} {msg.altitude_units}")
-                    else:
-                        print("? No fix yet?")
+            elif isinstance(msg, pynmea2.types.talker.RMC):
+                print("=== GPS RMC ===")
+                print(f"Lat: {msg.latitude}, Lon: {msg.longitude}")
+                print(f"Speed: {msg.spd_over_grnd} knots")
+                print(f"Status: {'FIX' if msg.status=='A' else 'NO FIX'}")
+                print("---------------------")
 
-                elif isinstance(msg, pynmea2.RMC):
-                    status = msg.status
-                    if status == 'A':
-                        print(f"? RMC ? Active Fix: Lat {msg.latitude:.5f}, Lon {msg.longitude:.5f}")
-                    else:
-                        print("? RMC ? No valid fix yet")
-
-            except pynmea2.ParseError:
-                continue
-
-    except KeyboardInterrupt:
-        print("\n? Stopped.")
-    except Exception as e:
-        print(f"? Error: {e}")
+        except pynmea2.ParseError:
+            pass  # ignore junk
+        except KeyboardInterrupt:
+            print("Exiting.")
+            break
 
 if __name__ == "__main__":
-    check_gps()
+    main()
